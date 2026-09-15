@@ -1,0 +1,6 @@
+node_modules
+dist
+.env
+# The token store. Holds live access and refresh tokens — never commit it, and keep it off
+# any shared volume. See src/oauth/store.ts on why it is a file at this scale.
+data/
