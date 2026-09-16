@@ -51,8 +51,12 @@ those users can see.
 npm install
 cp .env.example .env     # then fill it in
 npm run build
-npm start
+npm run start:local
 ```
+
+`start:local` loads `.env` itself; plain `npm start` does not, and is the one to use under a
+process manager that supplies the environment — see the systemd unit in
+[`DEPLOYMENT.md`](DEPLOYMENT.md). Node 20.6 or newer, for `--env-file`.
 
 On the portal side, set in its `.env`:
 

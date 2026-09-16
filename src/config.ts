@@ -11,7 +11,7 @@ function required(name: string): string {
 
   if (!value || value.trim() === '') {
     throw new Error(
-      `${name} is not set. The connector cannot start without it — see connector/.env.example.`,
+      `${name} is not set. The connector cannot start without it — see .env.example.`,
     );
   }
 

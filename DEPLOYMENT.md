@@ -23,7 +23,7 @@ In the portal: **Administration → Portal Connector → Settings & Activity**
 
 ```bash
 # terminal 2 — the connector
-cd connector
+cd portal-connector          # wherever you cloned it
 npm ci
 npm run build
 
@@ -34,8 +34,12 @@ PORTAL_BASE_URL=http://127.0.0.1:8000
 PORTAL_SERVICE_TOKEN=<the token you just copied>
 EOF
 
-npm start
+npm run start:local
 ```
+
+`start:local` rather than `start`: the service reads its configuration from the environment,
+not from a `.env` file, so plain `npm start` here would come up with nothing set and refuse
+to boot. Step 2 needs no such flag — systemd supplies the environment itself.
 
 It prints the callback URL it expects. It must match what you registered, character for
 character.
@@ -82,7 +86,8 @@ to it. It needs to be reachable by:
 Node 20 or newer.
 
 ```bash
-git clone <repo> ecommarise && cd ecommarise/connector
+git clone https://github.com/ecommarise/portal-connector.git /srv/portal-connector
+cd /srv/portal-connector
 npm ci
 npm run build
 ```
@@ -119,9 +124,9 @@ Description=Ecommarise Connector
 After=network.target
 
 [Service]
-WorkingDirectory=/srv/ecommarise/connector
+WorkingDirectory=/srv/portal-connector
 ExecStart=/usr/bin/node dist/index.js
-EnvironmentFile=/srv/ecommarise/connector/.env
+EnvironmentFile=/srv/portal-connector/.env
 Restart=always
 User=ecommarise
 
