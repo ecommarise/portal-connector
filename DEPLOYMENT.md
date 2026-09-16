@@ -18,8 +18,9 @@ php artisan serve --port=8000
 
 In the portal: **Administration → Portal Connector → Settings & Activity**
 
-1. **Service token** → How: *Generate one for me* → reason → **Generate token**. Copy the value.
-2. **Redirect URIs** → add `http://localhost:8787/callback` → reason → Save.
+1. **Redirect URIs** → add `http://localhost:8787/callback` → reason → Save.
+
+Leave the service token alone. The connector asks for one itself, in a moment.
 
 ```bash
 # terminal 2 — the connector
@@ -31,11 +32,15 @@ cat > .env <<'EOF'
 CONNECTOR_ISSUER=http://localhost:8787
 PORT=8787
 PORTAL_BASE_URL=http://127.0.0.1:8000
-PORTAL_SERVICE_TOKEN=<the token you just copied>
 EOF
 
 npm run start:local
 ```
+
+It starts without a token and says so. Now give it one — **Connect a connector** in the
+portal's settings screen, generate a code, and paste it at <http://localhost:8787/setup>. The
+connector generates its own service token, registers it, and stores it in `data/`. You never
+see that token, and nothing needs restarting.
 
 `start:local` rather than `start`: the service reads its configuration from the environment,
 not from a `.env` file, so plain `npm start` here would come up with nothing set and refuse
@@ -98,11 +103,14 @@ npm run build
 CONNECTOR_ISSUER=https://connector.yourdomain.com
 PORT=8787
 PORTAL_BASE_URL=http://10.0.0.5          # the portal, privately
-PORTAL_SERVICE_TOKEN=<generated in the portal>
 ACCESS_TOKEN_TTL=3600
 REFRESH_TOKEN_TTL=2592000
 DATA_DIR=data
 ```
+
+No `PORTAL_SERVICE_TOKEN`. Once the service is up behind TLS, enrol it: generate a code under
+**Connect a connector** in the portal and paste it at `https://connector.yourdomain.com/setup`.
+Set the variable only if you cannot reach that page — an enrolled token overrides it anyway.
 
 `CONNECTOR_ISSUER` must be `https://` — the service refuses to start otherwise, because an
 issuer on plain HTTP hands every token to anyone on the path.
@@ -226,10 +234,25 @@ somebody probing for a redirect they can widen. The connector prints the exact U
 at startup. Copy it from there.
 
 **3. Rotating the token and forgetting the connector.**
-Rotation keeps the previous token working for the grace window you choose (default an hour).
-Update `PORTAL_SERVICE_TOKEN` on the connector host and restart within that window, then use
-**Revoke it now** on the settings screen. Miss the window and the connector stops until you
-update it — no data is lost, but nobody's Claude works until you do.
+This is what enrolment is for: generate a code, paste it at `/setup`, done — the connector
+replaces its own token and the old one keeps working for an hour behind it. Then use **Revoke
+it now** on the settings screen to close that window early.
+
+The trap only exists on the manual path. If you rotate from **Service token** instead, you must
+update `PORTAL_SERVICE_TOKEN` on this host and restart within the grace window. Miss it and the
+connector stops until you do — no data is lost, but nobody's Claude works until then.
+
+**4. Expecting "disconnect" in Claude to end somebody's access.**
+It does not, and it never did — disconnecting is a client-side action and tells this service
+nothing. The tokens stay valid, so reconnecting resumes without a browser opening. To actually
+end somebody's access use **End sessions** on the settings screen; that is the only thing that
+does it, short of deactivating the user.
+
+**5. An enrolment you did not perform.**
+The settings screen lists recent enrolments with the address each connector claimed and the
+address it actually called from. If one succeeded that nobody recognises, somebody had a live
+enrolment code: generate a new one and enrol the real connector, which puts a token only it
+knows back in force, then revoke the previous one immediately.
 
 ---
 

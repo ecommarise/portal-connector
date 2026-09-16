@@ -81,7 +81,7 @@ export async function handleMcpRequest(
 export function authenticate(
   req: Request,
   store: TokenStore,
-): { userId: number; userName: string } | null {
+): { userId: number; userName: string; sessionStarted: number } | null {
   const header = req.header('authorization') ?? '';
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
 
@@ -91,7 +91,9 @@ export function authenticate(
 
   if (!token) return null;
 
-  return { userId: token.user_id, userName: token.user_name };
+  // A token from a store written before sessions existed has no start time. Reported as 0 —
+  // the beginning of time — so any revocation at all covers it. Wrong in the safe direction.
+  return { userId: token.user_id, userName: token.user_name, sessionStarted: token.session_started ?? 0 };
 }
 
 export function unauthorized(res: Response, config: Config): void {

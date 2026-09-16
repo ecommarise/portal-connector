@@ -61,15 +61,64 @@ process manager that supplies the environment — see the systemd unit in
 On the portal side, set in its `.env`:
 
 ```
-CONNECTOR_SERVICE_TOKEN=<the same value as PORTAL_SERVICE_TOKEN here>
 CONNECTOR_ALLOWED_IPS=<this host's address>
 CONNECTOR_REDIRECT_URIS=https://connector.example.com/callback
 ```
 
 The callback URI must match exactly — the portal does no prefix matching, deliberately.
 
+`CONNECTOR_SERVICE_TOKEN` is **not** in that list, and that is the point. See below.
+
 Then add the connector in Claude as a custom connector pointing at `https://…/mcp`. Registration
 is dynamic; there is nothing to configure by hand.
+
+## Getting the service token — enrolment
+
+The connector proves it is the connector with a shared service token. It gets one by enrolling,
+which takes two steps and no file editing:
+
+1. In the portal: **Administration → Portal Connector → Settings & Activity → Connect a
+   connector**. Give a reason, generate a code. It lasts fifteen minutes and works once.
+2. Open `https://…/setup` on this connector and paste the code.
+
+This service then generates a service token, registers it with the portal, and writes it to
+`DATA_DIR`. The plaintext never exists outside this host: not in a clipboard, not in a chat
+message, not in a `.env`, not in anyone's shell history.
+
+That matters more than it first sounds. The old path — generate on the settings screen, copy,
+paste into `PORTAL_SERVICE_TOKEN`, restart — needs somebody with shell access on this machine
+every time the token changes, which is the practical reason a token that "should be rotated
+quarterly" never is. Rotating now means generating a code and pasting it; the token in force
+keeps working for an hour while that happens, so there is no outage to schedule around.
+
+`PORTAL_SERVICE_TOKEN` still works and still wins nothing: an enrolled token takes precedence.
+Keep it for the case enrolment cannot cover — a portal whose settings screen is unreachable, or
+a token that has to change before anybody can get to `/setup`.
+
+`GET /healthz` reports `token: "enrolled" | "env" | "none"`, so a monitor can tell a connector
+nobody finished setting up from one that is merely quiet.
+
+## Signing one person out
+
+Each user's access is their own — they sign in at the portal's consent screen and this service
+keeps a token pair per user. Ending that is **Administration → Portal Connector → Settings &
+Activity → Who is using the connector → End sessions**, and it does not touch their portal
+account.
+
+Two things happen, and it is worth knowing which one is the enforcement:
+
+- **The portal refuses.** Every tool call carries the moment its session began, and the portal
+  refuses any call from a session that began before the revocation. This holds even if this
+  service is compromised, which is why the decision lives there.
+- **This service deletes what it holds.** It learns either from that refusal or from polling
+  `/internal/connector/revocations`, and drops the user's tokens.
+
+The second is what makes the difference visible. Without it, a client still holding a refresh
+token reconnects with no browser at all — which is how a revocation comes to look as though it
+never happened. Signing in again works normally: revoking ends sessions, it does not ban anyone.
+
+A session's start time is carried through every refresh rather than restamped, so refreshing is
+not a way out from under a revocation.
 
 ## Verifying it
 
@@ -83,8 +132,10 @@ migration, no browser. 28 checks, including the ones that matter most: an unregi
 `redirect_uri` is refused in place rather than redirected to, PKCE `plain` is rejected, a wrong
 verifier fails, codes cannot be replayed, and refresh tokens rotate.
 
-It does not prove the real portal answers correctly — that is what the portal's own 41 feature
-tests, in the portal repository under `tests/Feature/Connector`, are for.
+It does not prove the real portal answers correctly — that is what the portal's own feature
+tests, in the portal repository under `tests/Feature/Connector`, are for. Enrolment is covered
+there too, in `ConnectorEnrollmentTest`: what a spent, cancelled, expired or guessed code does,
+and that enrolment stays the only route on the internal API not behind the service token.
 
 ## The tools
 

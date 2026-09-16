@@ -247,7 +247,8 @@ export function registerOAuthRoutes(
         return;
       }
 
-      res.json(issueTokenPair(config, store, auth.client_id, auth.user_id, auth.user_name));
+      // A fresh sign-in: the session begins now.
+      res.json(issueTokenPair(config, store, auth.client_id, auth.user_id, auth.user_name, Date.now()));
       return;
     }
 
@@ -264,7 +265,12 @@ export function registerOAuthRoutes(
       // issued, so a stolen one is good only until its owner next refreshes.
       store.revokeToken(refresh);
 
-      res.json(issueTokenPair(config, store, stored.client_id, stored.user_id, stored.user_name));
+      // The same session continues — its start time is carried over, not reset. Resetting it
+      // here would make refreshing a way to walk out from under a revocation.
+      res.json(issueTokenPair(
+        config, store, stored.client_id, stored.user_id, stored.user_name,
+        stored.session_started ?? Date.now(),
+      ));
       return;
     }
 
@@ -278,6 +284,7 @@ function issueTokenPair(
   clientId: string,
   userId: number,
   userName: string,
+  sessionStarted: number,
 ): Record<string, unknown> {
   const access = newSecret(32);
   const refresh = newSecret(32);
@@ -289,6 +296,7 @@ function issueTokenPair(
       user_id: userId,
       user_name: userName,
       expires_at: Date.now() + config.accessTokenTtl * 1000,
+      session_started: sessionStarted,
     },
     access,
   );
@@ -300,6 +308,7 @@ function issueTokenPair(
       user_id: userId,
       user_name: userName,
       expires_at: Date.now() + config.refreshTokenTtl * 1000,
+      session_started: sessionStarted,
     },
     refresh,
   );

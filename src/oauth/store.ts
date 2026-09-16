@@ -61,6 +61,18 @@ export interface StoredToken {
   user_id: number;
   user_name: string;
   expires_at: number;
+  /**
+   * When the SIGN-IN behind this token happened, carried unchanged through every refresh.
+   *
+   * Not the same as when the token was issued, and the difference is the whole point. A
+   * refresh mints a new pair but continues the same session, so an administrator revoking at
+   * 10:00 must kill a token minted at 10:05 from a session that began at 09:00. Stamping the
+   * issue time instead would let anybody outrun a revocation by refreshing.
+   *
+   * Optional on the type because a store written by an older build has tokens without it;
+   * those are treated as having begun at the dawn of time, which is the safe reading.
+   */
+  session_started?: number;
 }
 
 interface StoreShape {
@@ -174,6 +186,30 @@ export class TokenStore {
     if (!found || found.expires_at < Date.now()) return undefined;
 
     return found;
+  }
+
+  /**
+   * Throw away every token belonging to a session that began at or before `before`.
+   *
+   * Called when the portal says a user's sessions were ended. Deleting rather than marking
+   * them dead: the portal refuses these calls regardless, so keeping the rows would buy
+   * nothing except a file that still holds credentials somebody has decided to end.
+   *
+   * Returns how many went, for the log — "revoked 2 tokens for user 7" is the line that tells
+   * an operator the sweep is actually doing something.
+   */
+  revokeSessionsStartedBefore(userId: number, before: number): number {
+    const kept = this.state.tokens.filter(
+      (t) => t.user_id !== userId || (t.session_started ?? 0) > before,
+    );
+    const removed = this.state.tokens.length - kept.length;
+
+    if (removed > 0) {
+      this.state.tokens = kept;
+      this.flush();
+    }
+
+    return removed;
   }
 
   revokeToken(plain: string): void {

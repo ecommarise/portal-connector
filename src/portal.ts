@@ -30,7 +30,38 @@ export class PortalError extends Error {
 }
 
 export class PortalClient {
-  constructor(private readonly config: Config) {}
+  /**
+   * The token is read through a function, not captured once.
+   *
+   * Enrolment can replace it while the process is running — that is the point of enrolment —
+   * and a client holding a copy from boot would keep presenting the old one until somebody
+   * restarted the service, which is the restart enrolment exists to avoid.
+   */
+  constructor(
+    private readonly config: Config,
+    private readonly serviceToken: () => string | null,
+    /**
+     * Called when the portal says a user's sessions were ended, so the tokens this service is
+     * holding can be thrown away rather than kept until they expire.
+     *
+     * A callback rather than a direct TokenStore reference: this file is about talking to the
+     * portal, and nothing else here knows or should know how tokens are stored.
+     */
+    private readonly onSessionRevoked: (userId: number) => void = () => {},
+    /** When the acting user's sign-in happened. Set on a per-request clone; see forSession. */
+    private readonly sessionStarted: number | null = null,
+  ) {}
+
+  /**
+   * A copy of this client stamped with one session's start time.
+   *
+   * Made per request in index.ts, so the ten tools can keep calling `callTool(userId, …)`
+   * without each of them having to remember to pass a session along — a thing ten call sites
+   * would eventually get wrong in one place.
+   */
+  forSession(sessionStarted: number): PortalClient {
+    return new PortalClient(this.config, this.serviceToken, this.onSessionRevoked, sessionStarted);
+  }
 
   /** Redeem a portal authorization code for the identity behind it. */
   async exchange(code: string, redirectUri: string): Promise<PortalIdentity> {
@@ -39,6 +70,18 @@ export class PortalClient {
     });
 
     return body.data;
+  }
+
+  /**
+   * Which users have had their connector sessions ended.
+   *
+   * Asked on this service's own behalf, with no acting user — it is a question about
+   * everybody, and the answer is what lets this service delete tokens it should not keep.
+   */
+  async revocations(since: string | null): Promise<unknown> {
+    return this.request<unknown>('GET', '/revocations', {
+      query: since ? { since } : {},
+    });
   }
 
   /**
@@ -69,13 +112,34 @@ export class PortalClient {
       url.searchParams.set(key, String(value));
     }
 
+    const token = this.serviceToken();
+
+    if (!token) {
+      // Said in full rather than letting the portal answer 401, because the remedy is here,
+      // not there: this connector has never been given a token, and the person reading this
+      // needs to be sent to the setup page rather than to the portal's logs.
+      throw new PortalError(
+        'This connector has not been enrolled yet. An administrator generates an enrolment code '
+          + `in the portal under Administration → Portal Connector → Settings, then pastes it at ${this.config.issuer}/setup.`,
+        503,
+        null,
+      );
+    }
+
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.config.portalServiceToken}`,
+      Authorization: `Bearer ${token}`,
       Accept: 'application/json',
     };
 
     if (options.userId !== undefined) {
       headers['X-Connector-User'] = String(options.userId);
+
+      // Seconds, because that is what the portal parses, and because a millisecond precision
+      // the portal immediately truncates would only invite the two sides to disagree by less
+      // than a second at exactly the wrong moment.
+      if (this.sessionStarted !== null) {
+        headers['X-Connector-Session-Started'] = String(Math.floor(this.sessionStarted / 1000));
+      }
     }
 
     if (options.body !== undefined) {
@@ -102,6 +166,17 @@ export class PortalClient {
       const message =
         (parsed as { message?: string } | null)?.message ??
         `The portal refused the request (HTTP ${response.status}).`;
+
+      // The portal names this one refusal, because it is the only one that is an instruction
+      // rather than an answer: an administrator ended this person's sessions, so the tokens
+      // held here are to be deleted, not retried. Every other refusal is information for the
+      // user and is passed along untouched.
+      if (
+        options.userId !== undefined
+        && (parsed as { reason?: string } | null)?.reason === 'session_revoked'
+      ) {
+        this.onSessionRevoked(options.userId);
+      }
 
       throw new PortalError(message, response.status, parsed);
     }
