@@ -4,8 +4,8 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2022"],
-    // Explicit, because this project sits inside the portal repo and TypeScript would
-    // otherwise pull in every @types package from the portal's own node_modules up the tree.
+    // Explicit: only node types belong in scope, so nothing is picked up from a
+    // node_modules further up the tree if this checkout ever sits inside one.
     "types": ["node"],
     "outDir": "dist",
     "rootDir": "src",

@@ -5,7 +5,7 @@ without the portal being on the public internet.
 
 It is one of two halves. This service handles the MCP protocol and OAuth; the portal handles
 identity and every access decision. See
-[`docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md`](../docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md) §9 for
+[`docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md`](docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md) §9 for
 why it is split that way rather than built inside the Laravel application.
 
 ---
@@ -80,7 +80,7 @@ migration, no browser. 28 checks, including the ones that matter most: an unregi
 verifier fails, codes cannot be replayed, and refresh tokens rotate.
 
 It does not prove the real portal answers correctly — that is what the portal's own 41 feature
-tests in `tests/Feature/Connector` are for.
+tests, in the portal repository under `tests/Feature/Connector`, are for.
 
 ## The tools
 
@@ -112,6 +112,7 @@ unbuilt rather than guarded.
 - **`read_db_views` returns nothing useful yet.** No curated views exist in the portal and no
   read-only database user is provisioned. The tool refuses and says so. See §3.3 of the
   feasibility review.
-- **This lives in the portal's repository**, in this folder, for review convenience — it deploys
-  separately and shares nothing at runtime. Moving it to its own repository later is a `git
-  subtree split`, and nothing in the code assumes otherwise.
+- **The portal is a separate repository.** This service was split out of it with `git subtree
+  split`, so the history here is its own; nothing is shared at runtime beyond the HTTP calls in
+  `src/portal.ts`. The copy of the feasibility review in `docs/` is a snapshot — the portal's own
+  copy is the one that gets updated.

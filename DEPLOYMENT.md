@@ -231,7 +231,7 @@ update it — no data is lost, but nobody's Claude works until you do.
 ## What you will not be able to test yet
 
 - **`read_db_views`** refuses every call. No curated views exist and no read-only database user
-  is provisioned — see §3.3 of [the feasibility review](../docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md).
+  is provisioned — see §3.3 of [the feasibility review](docs/ECOMMARISE_CONNECTOR_FEASIBILITY.md).
   This is intended, not broken.
 - **`ask_knowledge`** returns nothing until knowledge chunks are written and activated. The
   §08 population run is what fills it, and it needs the connector working first — which is what
