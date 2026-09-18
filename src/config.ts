@@ -36,6 +36,18 @@ function optionalNumber(name: string, fallback: number): number {
   return parsed;
 }
 
+function list(name: string, fallback: string): string[] {
+  return (process.env[name] ?? fallback)
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s !== '');
+}
+
+/** True for http://localhost, http://127.0.0.1 and http://[::1] — development only. */
+export function isLoopbackHttp(url: URL): boolean {
+  return url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+}
+
 export interface Config {
   /** Public origin of THIS service, e.g. https://connector.ecommarise.com. No trailing slash. */
   issuer: string;
@@ -55,6 +67,26 @@ export interface Config {
    * An enrolled token always wins over this value.
    */
   portalServiceTokenFromEnv: string | null;
+
+  /** How long a call to the portal may take before it is abandoned, in milliseconds. */
+  portalTimeoutMs: number;
+
+  /**
+   * Hosts an MCP client may register an https redirect URI on (the host itself or any of its
+   * subdomains). Loopback http is always allowed, for desktop clients and development.
+   *
+   * Registration used to accept ANY redirect URI, so anybody could register a client pointing
+   * at their own server and send a user a sign-in link: the user approves on the real portal
+   * consent screen and the code — and a 30-day session — goes to the attacker.
+   */
+  allowedRedirectHosts: string[];
+
+  /**
+   * Express `trust proxy`. Default `loopback`: a reverse proxy on this host (Caddy, nginx) is
+   * trusted to report the caller's address, anything else is not. Without it every visitor
+   * looked like 127.0.0.1 behind the proxy and shared one rate-limit bucket.
+   */
+  trustProxy: string;
 
   /** Lifetimes, in seconds. */
   accessTokenTtl: number;
@@ -85,11 +117,35 @@ export function loadConfig(): Config {
     throw new Error('CONNECTOR_ISSUER must be an https:// URL (http://localhost is allowed for development).');
   }
 
+  const portalBaseUrl = required('PORTAL_BASE_URL').replace(/\/+$/, '');
+  const portalUrl = new URL(portalBaseUrl);
+
+  // The service token travels on every portal call, and with it anybody can call the portal's
+  // internal API. Over plain http it can be read off the wire by anything on that network.
+  // Refused unless the operator says, explicitly, that the path is private and encrypted
+  // underneath (a WireGuard tunnel, an SSH tunnel) — and even then it is said at every boot.
+  if (portalUrl.protocol !== 'https:' && !isLoopbackHttp(portalUrl)) {
+    if (process.env.PORTAL_ALLOW_HTTP !== 'true') {
+      throw new Error(
+        'PORTAL_BASE_URL must be https:// — the service token is sent on every call. If the portal is '
+          + 'reached over an encrypted private tunnel (WireGuard, SSH), set PORTAL_ALLOW_HTTP=true to say so.',
+      );
+    }
+
+    console.warn(
+      `[config] PORTAL_BASE_URL is plain http (${portalUrl.origin}). PORTAL_ALLOW_HTTP=true says this path is `
+        + 'an encrypted private tunnel; if it is not, the service token is readable on the network.',
+    );
+  }
+
   return {
     issuer,
     port: optionalNumber('PORT', 8787),
-    portalBaseUrl: required('PORTAL_BASE_URL').replace(/\/+$/, ''),
+    portalBaseUrl,
     portalServiceTokenFromEnv: optionalString('PORTAL_SERVICE_TOKEN'),
+    portalTimeoutMs: optionalNumber('PORTAL_TIMEOUT_MS', 15_000),
+    allowedRedirectHosts: list('ALLOWED_REDIRECT_HOSTS', 'claude.ai,claude.com'),
+    trustProxy: process.env.TRUST_PROXY?.trim() || 'loopback',
     accessTokenTtl: optionalNumber('ACCESS_TOKEN_TTL', 3600),
     refreshTokenTtl: optionalNumber('REFRESH_TOKEN_TTL', 60 * 60 * 24 * 30),
     authCodeTtl: optionalNumber('AUTH_CODE_TTL', 60),

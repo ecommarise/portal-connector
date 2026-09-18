@@ -32,11 +32,11 @@ export type ServiceTokenSource = 'enrolled' | 'env' | 'none';
 
 interface EnrolledToken {
   token: string;
-  /** The portal this token was registered with. A token is worthless anywhere else. */
+  /** The portal this token was registered with. It is never presented anywhere else. */
   portal_base_url: string;
   enrolled_at: string;
-  /** Who issued the enrolment code, as the portal reported it. For the operator, not for auth. */
-  issued_by: string | null;
+  /** Older files carried the issuing administrator's name; it is no longer written or shown. */
+  issued_by?: string | null;
 }
 
 export class ServiceTokenStore {
@@ -61,10 +61,32 @@ export class ServiceTokenStore {
     return new ServiceTokenStore(file, envToken, enrolled);
   }
 
-  /** The token to present, or null when this connector has not been given one. */
-  current(): string | null {
-    return this.enrolled?.token ?? this.envToken;
+  /**
+   * The token to present to `portalBaseUrl`, or null when there is none for it.
+   *
+   * An enrolled token is only ever sent to the portal it was registered with. If PORTAL_BASE_URL
+   * is changed — or mistyped — the live token is withheld rather than handed to whatever host
+   * the new value names; the connector then needs enrolling against the new portal.
+   */
+  current(portalBaseUrl?: string): string | null {
+    if (this.enrolled) {
+      if (portalBaseUrl !== undefined && this.enrolled.portal_base_url !== portalBaseUrl) {
+        if (!this.warnedMismatch) {
+          console.warn(
+            `[service-token] enrolled for ${this.enrolled.portal_base_url}, but PORTAL_BASE_URL is ${portalBaseUrl}; `
+              + 'not sending it. Enrol again at /setup for the new portal.',
+          );
+          this.warnedMismatch = true;
+        }
+        return this.envToken;
+      }
+      return this.enrolled.token;
+    }
+
+    return this.envToken;
   }
+
+  private warnedMismatch = false;
 
   source(): ServiceTokenSource {
     if (this.enrolled) return 'enrolled';
@@ -73,12 +95,11 @@ export class ServiceTokenStore {
     return 'none';
   }
 
-  /** What the setup page and /healthz may say about it. Never the token itself. */
-  describe(): { source: ServiceTokenSource; enrolled_at: string | null; issued_by: string | null } {
+  /** What the setup page and /healthz may say about it. Never the token, never a person. */
+  describe(): { source: ServiceTokenSource; enrolled_at: string | null } {
     return {
       source: this.source(),
       enrolled_at: this.enrolled?.enrolled_at ?? null,
-      issued_by: this.enrolled?.issued_by ?? null,
     };
   }
 
@@ -90,12 +111,11 @@ export class ServiceTokenStore {
    * connector that cannot read its own token is a connector that cannot re-enrol without
    * somebody logging into this host, which is exactly the situation enrolment exists to end.
    */
-  adopt(token: string, portalBaseUrl: string, issuedBy: string | null): void {
+  adopt(token: string, portalBaseUrl: string): void {
     const record: EnrolledToken = {
       token,
       portal_base_url: portalBaseUrl,
       enrolled_at: new Date().toISOString(),
-      issued_by: issuedBy,
     };
 
     mkdirSync(dirname(this.file), { recursive: true });
@@ -105,5 +125,6 @@ export class ServiceTokenStore {
     renameSync(temp, this.file);
 
     this.enrolled = record;
+    this.warnedMismatch = false;
   }
 }

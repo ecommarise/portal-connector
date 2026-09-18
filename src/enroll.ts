@@ -23,41 +23,17 @@ import { randomBytes } from 'node:crypto';
 import type { Express, Request, Response } from 'express';
 
 import type { Config } from './config.js';
-import { PortalError } from './portal.js';
+import { RateLimiter } from './limiter.js';
+import { PortalError, portalMessage } from './portal.js';
 import type { ServiceTokenStore } from './serviceToken.js';
 
 /**
- * A small fixed-window limiter, per address.
- *
- * In memory and per process, which is the right size for the job: this endpoint is used once
- * in a connector's life, so the limiter exists to make code-guessing pointless rather than to
- * meter real traffic. The portal enforces its own limit too, and that one is the authority.
+ * Ten attempts a minute per address. This endpoint is used once in a connector's life, so the
+ * limit exists to make code-guessing pointless rather than to meter real traffic. The portal
+ * enforces its own limit too, and that one is the authority. Per real address: index.ts sets
+ * `trust proxy`, so behind Caddy each visitor is counted separately instead of all as 127.0.0.1.
  */
-class AttemptLimiter {
-  private readonly hits = new Map<string, { count: number; resetAt: number }>();
-
-  constructor(private readonly max: number, private readonly windowMs: number) {}
-
-  allow(key: string): boolean {
-    const now = Date.now();
-    const entry = this.hits.get(key);
-
-    if (!entry || entry.resetAt <= now) {
-      this.hits.set(key, { count: 1, resetAt: now + this.windowMs });
-      return true;
-    }
-
-    // Bounded so a flood cannot grow the map without limit; entries are dropped on the next
-    // window anyway.
-    if (this.hits.size > 10_000) this.hits.clear();
-
-    entry.count += 1;
-
-    return entry.count <= this.max;
-  }
-}
-
-const limiter = new AttemptLimiter(10, 60_000);
+const limiter = new RateLimiter(10, 60_000);
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) =>
@@ -92,10 +68,12 @@ function page(body: string): string {
 function statusLine(tokens: ServiceTokenStore): string {
   const state = tokens.describe();
 
+  // Enrolled or not, and when — never by whom. This page is public, and a named administrator
+  // is a phishing target handed to anybody who finds the URL.
   if (state.source === 'enrolled') {
     return `<p class="ok">This connector is enrolled${
       state.enrolled_at ? ` (${escapeHtml(state.enrolled_at)})` : ''
-    }${state.issued_by ? `, on a code issued by ${escapeHtml(state.issued_by)}` : ''}.</p>`;
+    }.</p>`;
   }
 
   if (state.source === 'env') {
@@ -151,9 +129,9 @@ export function registerSetupRoutes(app: Express, config: Config, tokens: Servic
     try {
       const accepted = await enrollWithPortal(config, code, serviceToken);
 
-      tokens.adopt(serviceToken, config.portalBaseUrl, accepted.issued_by ?? null);
+      tokens.adopt(serviceToken, config.portalBaseUrl);
 
-      console.log(`[setup] enrolled with the portal (code issued by ${accepted.issued_by ?? 'unknown'})`);
+      console.log('[setup] enrolled with the portal');
 
       res.type('html').send(page(`
         <h1>Enrolled</h1>
@@ -190,7 +168,6 @@ export function registerSetupRoutes(app: Express, config: Config, tokens: Servic
 
 interface EnrollmentAccepted {
   portal?: string;
-  issued_by?: string;
   previous_token_valid_for_minutes?: number;
 }
 
@@ -202,11 +179,18 @@ interface EnrollmentAccepted {
  * make the bootstrap depend on the thing it bootstraps.
  */
 async function enrollWithPortal(config: Config, code: string, serviceToken: string): Promise<EnrollmentAccepted> {
-  const response = await fetch(`${config.portalBaseUrl}/internal/connector/enroll`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ code, service_token: serviceToken, connector_issuer: config.issuer }),
-  });
+  let response: globalThis.Response;
+
+  try {
+    response = await fetch(`${config.portalBaseUrl}/internal/connector/enroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ code, service_token: serviceToken, connector_issuer: config.issuer }),
+      signal: AbortSignal.timeout(config.portalTimeoutMs),
+    });
+  } catch {
+    throw new PortalError('The portal could not be reached. Check PORTAL_BASE_URL and try again.', 504, null);
+  }
 
   const text = await response.text();
   let parsed: unknown = null;
@@ -220,8 +204,7 @@ async function enrollWithPortal(config: Config, code: string, serviceToken: stri
 
   if (!response.ok) {
     throw new PortalError(
-      (parsed as { message?: string } | null)?.message
-        ?? `The portal refused the enrolment (HTTP ${response.status}).`,
+      portalMessage((parsed as { message?: unknown } | null)?.message, response.status),
       response.status,
       parsed,
     );

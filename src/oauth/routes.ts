@@ -10,10 +10,10 @@
  * The flow, end to end:
  *
  *   1. Claude              → GET  /authorize            (client_id, PKCE challenge, state)
- *   2. we redirect the browser → portal /connector/authorize
+ *   2. we redirect the browser → portal /connector/authorize   (+ which client is asking)
  *   3. the user consents in the portal
  *   4. portal redirects        → GET /callback          (portal's one-time code)
- *   5. we exchange that code server-to-server for the user's identity
+ *   5. we exchange that code server-to-server for the user's identity and a portal GRANT
  *   6. we redirect the browser → Claude's redirect_uri   (OUR authorization code)
  *   7. Claude              → POST /token                (code + code_verifier)
  *
@@ -26,9 +26,15 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Express, Request, Response } from 'express';
 
-import type { Config } from '../config.js';
+import { isLoopbackHttp, type Config } from '../config.js';
+import { RateLimiter } from '../limiter.js';
 import type { PortalClient } from '../portal.js';
 import { hashToken, newSecret, TokenStore } from './store.js';
+
+const MAX_REDIRECT_URIS = 5;
+const MAX_URI_LENGTH = 500;
+const MAX_CLIENT_NAME = 100;
+const MAX_STATE_LENGTH = 500;
 
 /** The URI the PORTAL redirects back to. Registered in the portal's CONNECTOR_REDIRECT_URIS. */
 export function portalCallbackUrl(config: Config): string {
@@ -52,12 +58,49 @@ function redirectWithError(res: Response, redirectUri: string, error: string, st
   res.redirect(url.toString());
 }
 
+/**
+ * May a client register this redirect URI?
+ *
+ * https on an allowed host (claude.ai, claude.com and their subdomains by default), or plain
+ * http on loopback for desktop clients and development. Anything else is refused: an open
+ * registration endpoint that accepts any URI lets anybody mint a client that sends a user's
+ * sign-in to their own server, behind the portal's genuine consent screen.
+ */
+export function redirectAllowed(raw: string, allowedHosts: string[]): boolean {
+  let url: URL;
+
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+
+  if (url.hash !== '' || url.username !== '' || url.password !== '') return false;
+  if (isLoopbackHttp(url)) return true;
+  if (url.protocol !== 'https:') return false;
+
+  const host = url.hostname.toLowerCase();
+
+  return allowedHosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+}
+
+function tooMany(res: Response): void {
+  res.status(429).json({ error: 'slow_down', error_description: 'Too many requests. Wait a minute and try again.' });
+}
+
 export function registerOAuthRoutes(
   app: Express,
   config: Config,
   store: TokenStore,
   portal: PortalClient,
 ): void {
+  // Per address, per minute. Generous for a person signing in; nothing for a script trying to
+  // fill the store or walk the code space.
+  const registerLimit = new RateLimiter(10, 60_000);
+  const authorizeLimit = new RateLimiter(30, 60_000);
+  const tokenLimit = new RateLimiter(60, 60_000);
+  const ip = (req: Request) => req.ip ?? 'unknown';
+
   // ------------------------------------------------------------------ discovery
 
   app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
@@ -72,7 +115,7 @@ export function registerOAuthRoutes(
       // itself out of the protection PKCE exists to give.
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none'],
-      scopes_supported: ['portal:read'],
+      scopes_supported: ['portal'],
     });
   });
 
@@ -80,30 +123,50 @@ export function registerOAuthRoutes(
     res.json({
       resource: config.issuer,
       authorization_servers: [config.issuer],
-      scopes_supported: ['portal:read'],
+      scopes_supported: ['portal'],
     });
   });
 
   // ------------------------------------------------------------------ dynamic registration
 
   app.post('/register', (req: Request, res: Response) => {
-    const body = req.body as { client_name?: unknown; redirect_uris?: unknown };
+    if (!registerLimit.allow(ip(req))) {
+      tooMany(res);
+      return;
+    }
+
+    const body = (req.body ?? {}) as { client_name?: unknown; redirect_uris?: unknown };
     const redirectUris = Array.isArray(body.redirect_uris)
       ? body.redirect_uris.filter((u): u is string => typeof u === 'string' && u.length > 0)
       : [];
 
-    if (redirectUris.length === 0) {
+    if (redirectUris.length === 0 || redirectUris.length > MAX_REDIRECT_URIS) {
       res.status(400).json({
         error: 'invalid_client_metadata',
-        error_description: 'At least one redirect_uri is required.',
+        error_description: `Between 1 and ${MAX_REDIRECT_URIS} redirect_uris are required.`,
       });
       return;
     }
 
-    const client = store.registerClient(
-      typeof body.client_name === 'string' ? body.client_name : 'Unnamed MCP client',
-      redirectUris,
-    );
+    if (redirectUris.some((u) => u.length > MAX_URI_LENGTH || !redirectAllowed(u, config.allowedRedirectHosts))) {
+      res.status(400).json({
+        error: 'invalid_redirect_uri',
+        error_description:
+          'Redirect URIs must be https on an allowed host, or http on localhost. This connector is for Claude.',
+      });
+      return;
+    }
+
+    const name = typeof body.client_name === 'string' && body.client_name.trim() !== ''
+      ? body.client_name.trim().slice(0, MAX_CLIENT_NAME)
+      : 'Unnamed MCP client';
+
+    const client = store.registerClient(name, redirectUris);
+
+    if (!client) {
+      res.status(503).json({ error: 'temporarily_unavailable', error_description: 'Registration is full. Try again later.' });
+      return;
+    }
 
     // A public client: no secret. The client is a desktop or cloud application that cannot
     // keep one, which is exactly the case PKCE was designed for — issuing a secret it must
@@ -122,6 +185,11 @@ export function registerOAuthRoutes(
   // ------------------------------------------------------------------ authorize
 
   app.get('/authorize', (req: Request, res: Response) => {
+    if (!authorizeLimit.allow(ip(req))) {
+      res.status(429).send('Too many sign-in attempts. Wait a minute and try again.');
+      return;
+    }
+
     const clientId = String(req.query.client_id ?? '');
     const redirectUri = String(req.query.redirect_uri ?? '');
     const responseType = String(req.query.response_type ?? '');
@@ -144,8 +212,9 @@ export function registerOAuthRoutes(
       return;
     }
 
-    if (method !== 'S256' || codeChallenge === '') {
-      redirectWithError(res, redirectUri, 'invalid_request', state);
+    if (method !== 'S256' || codeChallenge === '' || codeChallenge.length > 128
+      || (state !== null && state.length > MAX_STATE_LENGTH)) {
+      redirectWithError(res, redirectUri, 'invalid_request', null);
       return;
     }
 
@@ -153,18 +222,26 @@ export function registerOAuthRoutes(
     // would let whoever chose it recognise the login when it comes back.
     const portalState = newSecret(24);
 
-    store.startPortalLogin({
+    if (!store.startPortalLogin({
       state: portalState,
       client_id: clientId,
       client_redirect_uri: redirectUri,
       client_state: state,
       code_challenge: codeChallenge,
       expires_at: Date.now() + 10 * 60 * 1000,
-    });
+    })) {
+      res.status(503).send('Too many sign-ins in progress. Try again in a few minutes.');
+      return;
+    }
 
     const portalUrl = new URL(`${config.portalBaseUrl}/connector/authorize`);
     portalUrl.searchParams.set('redirect_uri', portalCallbackUrl(config));
     portalUrl.searchParams.set('state', portalState);
+    // Who is asking, for the consent screen to say so. Informational — the portal checks
+    // nothing against it — but without it the screen could not tell "Claude" from a client
+    // somebody registered five minutes ago, and neither could the person approving.
+    portalUrl.searchParams.set('client_name', client.client_name);
+    portalUrl.searchParams.set('client_host', new URL(redirectUri).host);
 
     res.redirect(portalUrl.toString());
   });
@@ -172,6 +249,11 @@ export function registerOAuthRoutes(
   // ------------------------------------------------------------------ portal callback
 
   app.get('/callback', async (req: Request, res: Response) => {
+    if (!authorizeLimit.allow(ip(req))) {
+      res.status(429).send('Too many sign-in attempts. Wait a minute and try again.');
+      return;
+    }
+
     const portalCode = String(req.query.code ?? '');
     const portalState = String(req.query.state ?? '');
 
@@ -199,6 +281,13 @@ export function registerOAuthRoutes(
       return;
     }
 
+    // A portal too old to issue grants cannot be called on anybody's behalf any more.
+    if (typeof identity.grant !== 'string' || identity.grant === '') {
+      console.error('[oauth] the portal did not return a grant on exchange — update the portal');
+      redirectWithError(res, login.client_redirect_uri, 'server_error', login.client_state);
+      return;
+    }
+
     const code = newSecret(32);
 
     store.issueAuthorization({
@@ -208,6 +297,7 @@ export function registerOAuthRoutes(
       code_challenge: login.code_challenge,
       user_id: identity.user_id,
       user_name: identity.name,
+      grant: identity.grant,
       expires_at: Date.now() + config.authCodeTtl * 1000,
       used: false,
     });
@@ -222,14 +312,21 @@ export function registerOAuthRoutes(
   // ------------------------------------------------------------------ token
 
   app.post('/token', (req: Request, res: Response) => {
-    const body = req.body as Record<string, unknown>;
+    if (!tokenLimit.allow(ip(req))) {
+      tooMany(res);
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const grantType = String(body.grant_type ?? '');
+    const clientId = String(body.client_id ?? '');
 
     if (grantType === 'authorization_code') {
       const code = String(body.code ?? '');
       const verifier = String(body.code_verifier ?? '');
       const redirectUri = String(body.redirect_uri ?? '');
 
+      // A code presented twice revokes what the first presentation produced (store.ts).
       const auth = store.takeAuthorization(code);
 
       if (!auth) {
@@ -237,7 +334,7 @@ export function registerOAuthRoutes(
         return;
       }
 
-      if (auth.redirect_uri !== redirectUri || auth.client_id !== String(body.client_id ?? '')) {
+      if (auth.redirect_uri !== redirectUri || auth.client_id !== clientId) {
         res.status(400).json({ error: 'invalid_grant', error_description: 'Code was issued for a different request.' });
         return;
       }
@@ -247,30 +344,51 @@ export function registerOAuthRoutes(
         return;
       }
 
-      // A fresh sign-in: the session begins now.
-      res.json(issueTokenPair(config, store, auth.client_id, auth.user_id, auth.user_name, Date.now()));
+      // A fresh sign-in: the session begins now, and its family is the code that started it.
+      res.json(issueTokenPair(config, store, {
+        clientId: auth.client_id,
+        userId: auth.user_id,
+        userName: auth.user_name,
+        grant: auth.grant,
+        family: auth.code_hash,
+        sessionStarted: Date.now(),
+      }));
       return;
     }
 
     if (grantType === 'refresh_token') {
       const refresh = String(body.refresh_token ?? '');
-      const stored = store.findToken(refresh, 'refresh');
 
-      if (!stored) {
+      // A rotated token presented again revokes its whole family (store.ts) — whoever holds
+      // the newer one may be the thief, and we cannot tell which.
+      const stored = store.findRefresh(refresh);
+
+      if (!stored || !stored.grant) {
         res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or expired refresh token.' });
         return;
       }
 
-      // Rotated, not reused: the old refresh token stops working the moment a new pair is
-      // issued, so a stolen one is good only until its owner next refreshes.
-      store.revokeToken(refresh);
+      // A refresh token works only for the client it was issued to. Public clients have no
+      // secret, but they do send their client_id, and a stolen token offered by another client
+      // is refused rather than extended.
+      if (stored.client_id !== clientId) {
+        res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token was issued to a different client.' });
+        return;
+      }
 
-      // The same session continues — its start time is carried over, not reset. Resetting it
-      // here would make refreshing a way to walk out from under a revocation.
-      res.json(issueTokenPair(
-        config, store, stored.client_id, stored.user_id, stored.user_name,
-        stored.session_started ?? Date.now(),
-      ));
+      // Rotated, not reused: the old refresh token stops working the moment a new pair is
+      // issued. It is kept, marked spent, only so a replay of it can be recognised.
+      store.rotateRefresh(refresh);
+
+      // The same session continues — its start time and grant are carried over, not reset.
+      res.json(issueTokenPair(config, store, {
+        clientId: stored.client_id,
+        userId: stored.user_id,
+        userName: stored.user_name,
+        grant: stored.grant,
+        family: stored.family ?? stored.token_hash,
+        sessionStarted: stored.session_started ?? Date.now(),
+      }));
       return;
     }
 
@@ -281,43 +399,35 @@ export function registerOAuthRoutes(
 function issueTokenPair(
   config: Config,
   store: TokenStore,
-  clientId: string,
-  userId: number,
-  userName: string,
-  sessionStarted: number,
+  session: {
+    clientId: string;
+    userId: number;
+    userName: string;
+    grant: string;
+    family: string;
+    sessionStarted: number;
+  },
 ): Record<string, unknown> {
   const access = newSecret(32);
   const refresh = newSecret(32);
 
-  store.issueToken(
-    {
-      kind: 'access',
-      client_id: clientId,
-      user_id: userId,
-      user_name: userName,
-      expires_at: Date.now() + config.accessTokenTtl * 1000,
-      session_started: sessionStarted,
-    },
-    access,
-  );
+  const common = {
+    client_id: session.clientId,
+    user_id: session.userId,
+    user_name: session.userName,
+    session_started: session.sessionStarted,
+    grant: session.grant,
+    family: session.family,
+  };
 
-  store.issueToken(
-    {
-      kind: 'refresh',
-      client_id: clientId,
-      user_id: userId,
-      user_name: userName,
-      expires_at: Date.now() + config.refreshTokenTtl * 1000,
-      session_started: sessionStarted,
-    },
-    refresh,
-  );
+  store.issueToken({ ...common, kind: 'access', expires_at: Date.now() + config.accessTokenTtl * 1000 }, access);
+  store.issueToken({ ...common, kind: 'refresh', expires_at: Date.now() + config.refreshTokenTtl * 1000 }, refresh);
 
   return {
     access_token: access,
     token_type: 'Bearer',
     expires_in: config.accessTokenTtl,
     refresh_token: refresh,
-    scope: 'portal:read',
+    scope: 'portal',
   };
 }

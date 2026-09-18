@@ -102,11 +102,23 @@ npm run build
 ```
 CONNECTOR_ISSUER=https://connector.yourdomain.com
 PORT=8787
-PORTAL_BASE_URL=http://10.0.0.5          # the portal, privately
+PORTAL_BASE_URL=https://portal.internal  # the portal, privately — over TLS
+ALLOWED_REDIRECT_HOSTS=claude.ai,claude.com
+TRUST_PROXY=loopback                     # Caddy/nginx on this host
 ACCESS_TOKEN_TTL=3600
 REFRESH_TOKEN_TTL=2592000
 DATA_DIR=data
 ```
+
+**The portal link must be encrypted.** The service token goes to the portal on every call, and
+whoever reads it can use the portal's internal API. `PORTAL_BASE_URL` is refused at boot if it
+is plain `http://` (other than localhost). If the two hosts talk over an encrypted private
+tunnel — WireGuard, an SSH tunnel — and the portal itself only speaks http inside it, set
+`PORTAL_ALLOW_HTTP=true` to say so; the service will start, and warn at every boot.
+
+**Behind a proxy on another host?** Set `TRUST_PROXY` to that proxy's address, and on the portal
+set `CONNECTOR_TRUSTED_PROXIES` to the address the connector's calls arrive from, so both sides'
+rate limits and the portal's IP allow-list see real addresses.
 
 No `PORTAL_SERVICE_TOKEN`. Once the service is up behind TLS, enrol it: generate a code under
 **Connect a connector** in the portal and paste it at `https://connector.yourdomain.com/setup`.
@@ -169,7 +181,7 @@ Back in the portal, **Administration → Portal Connector → Settings & Activit
 
 ```bash
 # on the connector host
-curl -i http://10.0.0.5/internal/connector/exchange
+curl -i https://portal.internal/internal/connector/exchange
 ```
 
 A `401` is the right answer — it means you reached the portal and it refused you for having no

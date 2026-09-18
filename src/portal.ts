@@ -1,22 +1,31 @@
 /**
  * The portal's internal API, as seen from here.
  *
- * Every method sends two things: the service token, which says "this is the connector", and
- * the acting user id, which says "on whose behalf". The portal decides the rest. Nothing in
- * this file asserts what a user may read — it cannot, and the portal would ignore it if it
- * tried, which is the arrangement that makes this service safe to run outside the network
- * perimeter.
+ * Every tool call sends two things: the service token, which says "this is the connector", and
+ * the user's GRANT, which says "on behalf of the person who consented". The grant is the secret
+ * the portal issued when that person went through its consent screen; the portal resolves the
+ * user, and when their session began, from its own record of it. Nothing in this file asserts
+ * who the user is or what they may read — it cannot, and that is the arrangement that makes
+ * this service safe to run outside the network perimeter.
+ *
+ * (It used to send `X-Connector-User: <id>`. With the service token, that let whoever held the
+ * token act as anybody. The portal no longer accepts it.)
  */
 
 import type { Config } from './config.js';
 
 export interface PortalIdentity {
+  /** Sent back as X-Connector-Grant on every call made for this user. */
+  grant: string;
   user_id: number;
   name: string;
   email: string;
   roles: string[];
   is_admin: boolean;
 }
+
+/** Longest portal error message passed on — to Claude, or to a browser on /setup. */
+const MAX_MESSAGE = 500;
 
 export class PortalError extends Error {
   constructor(
@@ -27,6 +36,17 @@ export class PortalError extends Error {
     super(message);
     this.name = 'PortalError';
   }
+}
+
+/** A portal message fit to pass on: one line, bounded, never an HTML error page. */
+export function portalMessage(raw: unknown, status: number): string {
+  const text = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+
+  if (text === '' || text.startsWith('<')) {
+    return `The portal refused the request (HTTP ${status}).`;
+  }
+
+  return text.length > MAX_MESSAGE ? `${text.slice(0, MAX_MESSAGE)}…` : text;
 }
 
 export class PortalClient {
@@ -41,29 +61,27 @@ export class PortalClient {
     private readonly config: Config,
     private readonly serviceToken: () => string | null,
     /**
-     * Called when the portal says a user's sessions were ended, so the tokens this service is
-     * holding can be thrown away rather than kept until they expire.
-     *
-     * A callback rather than a direct TokenStore reference: this file is about talking to the
-     * portal, and nothing else here knows or should know how tokens are stored.
+     * Called when the portal says this grant's session is over (an administrator ended it, or
+     * it predates grants), so the tokens this service holds for it can be thrown away rather
+     * than kept until they expire.
      */
-    private readonly onSessionRevoked: (userId: number) => void = () => {},
-    /** When the acting user's sign-in happened. Set on a per-request clone; see forSession. */
-    private readonly sessionStarted: number | null = null,
+    private readonly onSessionRevoked: (grant: string) => void = () => {},
+    /** The acting user's grant. Set on a per-request clone; see forSession. */
+    private readonly grant: string | null = null,
   ) {}
 
   /**
-   * A copy of this client stamped with one session's start time.
+   * A copy of this client acting for one signed-in session.
    *
-   * Made per request in index.ts, so the ten tools can keep calling `callTool(userId, …)`
-   * without each of them having to remember to pass a session along — a thing ten call sites
-   * would eventually get wrong in one place.
+   * Made per request in index.ts, so the ten tools can keep calling `callTool(…)` without each
+   * of them having to remember to pass the grant along — a thing ten call sites would
+   * eventually get wrong in one place.
    */
-  forSession(sessionStarted: number): PortalClient {
-    return new PortalClient(this.config, this.serviceToken, this.onSessionRevoked, sessionStarted);
+  forSession(grant: string): PortalClient {
+    return new PortalClient(this.config, this.serviceToken, this.onSessionRevoked, grant);
   }
 
-  /** Redeem a portal authorization code for the identity behind it. */
+  /** Redeem a portal authorization code for the identity behind it, and its grant. */
   async exchange(code: string, redirectUri: string): Promise<PortalIdentity> {
     const body = await this.request<{ data: PortalIdentity }>('POST', '/exchange', {
       body: { code, redirect_uri: redirectUri },
@@ -85,25 +103,28 @@ export class PortalClient {
   }
 
   /**
-   * Call a tool endpoint on behalf of a user.
+   * Call a tool endpoint on behalf of this session's user.
    *
    * `unknown` rather than a per-tool return type: these payloads go straight back to Claude as
    * text, and inventing TypeScript shapes for them here would be a second copy of the portal's
    * contract that nothing keeps in step with the first.
    */
   async callTool(
-    userId: number,
     method: 'GET' | 'POST' | 'PATCH',
     path: string,
     options: { query?: Record<string, unknown>; body?: unknown } = {},
   ): Promise<unknown> {
-    return this.request<unknown>(method, path, { ...options, userId });
+    if (this.grant === null) {
+      throw new PortalError('No signed-in session to act for.', 401, null);
+    }
+
+    return this.request<unknown>(method, path, { ...options, grant: this.grant });
   }
 
   private async request<T>(
     method: 'GET' | 'POST' | 'PATCH',
     path: string,
-    options: { query?: Record<string, unknown>; body?: unknown; userId?: number } = {},
+    options: { query?: Record<string, unknown>; body?: unknown; grant?: string } = {},
   ): Promise<T> {
     const url = new URL(`${this.config.portalBaseUrl}/internal/connector${path}`);
 
@@ -131,26 +152,34 @@ export class PortalClient {
       Accept: 'application/json',
     };
 
-    if (options.userId !== undefined) {
-      headers['X-Connector-User'] = String(options.userId);
-
-      // Seconds, because that is what the portal parses, and because a millisecond precision
-      // the portal immediately truncates would only invite the two sides to disagree by less
-      // than a second at exactly the wrong moment.
-      if (this.sessionStarted !== null) {
-        headers['X-Connector-Session-Started'] = String(Math.floor(this.sessionStarted / 1000));
-      }
+    if (options.grant !== undefined) {
+      headers['X-Connector-Grant'] = options.grant;
     }
 
     if (options.body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    });
+    let response: Response;
+
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        // A portal that stops answering must not hold a Claude request — and this process's
+        // sockets — open indefinitely.
+        signal: AbortSignal.timeout(this.config.portalTimeoutMs),
+      });
+    } catch (error) {
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+
+      throw new PortalError(
+        timedOut ? 'The portal did not answer in time. Try again shortly.' : 'The portal could not be reached.',
+        504,
+        null,
+      );
+    }
 
     const text = await response.text();
     let parsed: unknown = text;
@@ -158,24 +187,21 @@ export class PortalClient {
     try {
       parsed = text === '' ? null : JSON.parse(text);
     } catch {
-      // Left as text. A non-JSON body from the portal is usually an HTML error page, and
-      // seeing it is far more useful than a parse error that hides it.
+      // Left as text. A non-JSON body from the portal is usually an HTML error page — which
+      // portalMessage() will not pass on.
     }
 
     if (!response.ok) {
-      const message =
-        (parsed as { message?: string } | null)?.message ??
-        `The portal refused the request (HTTP ${response.status}).`;
+      const message = portalMessage((parsed as { message?: unknown } | null)?.message, response.status);
 
       // The portal names this one refusal, because it is the only one that is an instruction
-      // rather than an answer: an administrator ended this person's sessions, so the tokens
-      // held here are to be deleted, not retried. Every other refusal is information for the
-      // user and is passed along untouched.
+      // rather than an answer: this session is over, so the tokens held for it are to be
+      // deleted, not retried. Every other refusal is information for the user.
       if (
-        options.userId !== undefined
+        options.grant !== undefined
         && (parsed as { reason?: string } | null)?.reason === 'session_revoked'
       ) {
-        this.onSessionRevoked(options.userId);
+        this.onSessionRevoked(options.grant);
       }
 
       throw new PortalError(message, response.status, parsed);

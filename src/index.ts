@@ -26,15 +26,16 @@ const serviceTokens = ServiceTokenStore.open(config.dataDir, config.portalServic
 // Read per call rather than captured: enrolling replaces the token while the process runs.
 const portal = new PortalClient(
   config,
-  () => serviceTokens.current(),
-  // The portal has just refused this user because an administrator ended their sessions.
-  // Drop what we hold for them now rather than waiting for the sweep — the refusal arrived
-  // while they were using it, so this is the earliest anyone could know.
-  (userId) => {
-    const removed = store.revokeSessionsStartedBefore(userId, Date.now());
+  () => serviceTokens.current(config.portalBaseUrl),
+  // The portal has just refused this session as ended. Drop exactly the tokens presenting that
+  // grant — this sign-in, however often refreshed — and nothing else. (It used to drop every
+  // token of the user started before "now", which also killed a session they had begun after
+  // the revocation.)
+  (grant) => {
+    const removed = store.revokeByGrant(grant);
 
     if (removed > 0) {
-      console.log(`[revocations] portal ended user ${userId}'s sessions; dropped ${removed} token(s)`);
+      console.log(`[revocations] the portal ended a session; dropped ${removed} token(s)`);
     }
   },
 );
@@ -44,8 +45,26 @@ const sweeper = new RevocationSweeper(portal, store, config.revocationPollSecond
 const app = express();
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '4mb' }));
-app.use(express.urlencoded({ extended: true }));
+// Who the caller is, for the rate limits: trusted only from the reverse proxy in front of this
+// service (loopback by default). Without it everyone behind the proxy shared one address.
+app.set('trust proxy', config.trustProxy);
+
+// Headers for every response. Nothing here is meant to be framed by another site (the setup
+// page least of all), sniffed as another content type, or to leak its URL — which can carry a
+// code or state — in a Referer.
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
+// Tool calls are small. 4 MB let an anonymous caller make the server parse a large body on
+// every request to /register or /token before anything was checked.
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 
 registerSetupRoutes(app, config, serviceTokens);
 registerOAuthRoutes(app, config, store, portal);
@@ -64,9 +83,9 @@ app.post('/mcp', async (req, res) => {
 
   try {
     await handleMcpRequest(req, res, {
-      // Stamped with this session's start, so every call the tools make carries it and the
-      // portal can tell a session that predates a revocation from one that does not.
-      portal: portal.forSession(identity.sessionStarted),
+      // Acting for this session's portal grant — the portal resolves the user, and whether the
+      // session is still valid, from its own record of it.
+      portal: portal.forSession(identity.grant),
       userId: identity.userId,
       userName: identity.userName,
     });

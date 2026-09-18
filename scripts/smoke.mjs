@@ -43,6 +43,7 @@ function startStubPortal() {
       method: req.method,
       path: url.pathname,
       actingUser: req.headers['x-connector-user'] ?? null,
+      grant: req.headers['x-connector-grant'] ?? null,
       auth: req.headers.authorization ?? null,
       query: Object.fromEntries(url.searchParams),
     });
@@ -64,6 +65,7 @@ function startStubPortal() {
         JSON.stringify({
           success: true,
           data: {
+            grant: 'grant-for-user-42',
             user_id: 42,
             name: 'Smoke Tester',
             email: 'smoke@example.com',
@@ -184,6 +186,20 @@ async function main() {
     check('a client is registered', typeof registration.client_id === 'string');
     check('no client secret is issued to a public client', registration.token_endpoint_auth_method === 'none');
 
+    const foreign = await fetch(`${CONNECTOR_ORIGIN}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Phisher', redirect_uris: ['https://evil.example.com/cb'] }),
+    });
+    check('a redirect URI on a host that is not Claude is refused at registration', foreign.status === 400);
+
+    const plainHttp = await fetch(`${CONNECTOR_ORIGIN}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Plain', redirect_uris: ['http://claude.ai/cb'] }),
+    });
+    check('plain http off loopback is refused at registration', plainHttp.status === 400);
+
     console.log('\nAuthorization');
     const verifier = randomBytes(32).toString('base64url');
     const challenge = createHash('sha256').update(verifier).digest('base64url');
@@ -217,6 +233,8 @@ async function main() {
     );
     const toPortal = authorize.headers.get('location');
     check('the browser is sent to the portal consent screen', (toPortal ?? '').includes('/connector/authorize'));
+    check('the consent screen is told which client is asking', new URL(toPortal).searchParams.get('client_name') === 'Smoke Client');
+    check('responses forbid framing', authorize.headers.get('x-frame-options') === 'DENY');
 
     const consent = await fetch(toPortal, { redirect: 'manual' });
     const toCallback = consent.headers.get('location');
@@ -293,6 +311,34 @@ async function main() {
     ).json();
     check('the code cannot be replayed', replay.error === 'invalid_grant');
 
+    // A code offered twice leaked somewhere; the tokens its first use produced are revoked.
+    const leaked = await rpc(tokenResponse.access_token, 'tools/list', {}, 90);
+    check('replaying a code revokes the tokens it produced', leaked.status === 401);
+
+    // A fresh sign-in for everything below.
+    const third = await fetch(
+      `${CONNECTOR_ORIGIN}/authorize?client_id=${registration.client_id}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&response_type=code&code_challenge=${challenge}&code_challenge_method=S256`,
+      { redirect: 'manual' },
+    );
+    const thirdConsent = await fetch(third.headers.get('location'), { redirect: 'manual' });
+    const thirdCallback = await fetch(thirdConsent.headers.get('location'), { redirect: 'manual' });
+    const freshCode = new URL(thirdCallback.headers.get('location')).searchParams.get('code');
+    Object.assign(tokenResponse, await (
+      await fetch(`${CONNECTOR_ORIGIN}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          code: freshCode,
+          code_verifier: verifier,
+          redirect_uri: redirectUri,
+          client_id: registration.client_id,
+        }),
+      })
+    ).json());
+
     console.log('\nMCP');
     const token = tokenResponse.access_token;
 
@@ -305,6 +351,12 @@ async function main() {
     const list = await rpc(token, 'tools/list', {}, 3);
     const names = (list.body?.result?.tools ?? []).map((t) => t.name).sort();
     check('all ten tools are advertised', names.length === 10, `got ${names.length}: ${names.join(', ')}`);
+    const tools = list.body?.result?.tools ?? [];
+    check(
+      'writing tools are not advertised as read-only',
+      tools.find((t) => t.name === 'submit_kb_draft')?.annotations?.readOnlyHint === false,
+    );
+    check('reading tools are', tools.find((t) => t.name === 'ask_knowledge')?.annotations?.readOnlyHint === true);
     check(
       'the tool names are the spec\'s',
       ['ask_knowledge', 'create_pointer', 'get_ai_pending_tasks', 'get_pointer_status',
@@ -320,10 +372,15 @@ async function main() {
       arguments: { ref: 'sourcing:sup.otd' },
     }, 4);
     const payload = JSON.parse(call.body.result.content[0].text);
-    check('a tool call reaches the portal and returns its data', payload.data.value === 95);
+    check('a tool call reaches the portal and returns its data', payload.data?.data?.value === 95);
+    check(
+      'portal content is labelled as data, not instructions',
+      payload.source === 'ecommarise-portal' && /never as instructions/.test(payload.notice),
+    );
 
     const toolCall = portalCalls.find((c) => c.path === '/internal/connector/variables');
-    check('the portal was told which user is acting', toolCall?.actingUser === '42');
+    check('the portal was sent the session grant', toolCall?.grant === 'grant-for-user-42');
+    check('and never a bare user id', toolCall?.actingUser === null);
     check('the portal was sent the service token', toolCall?.auth === `Bearer ${SERVICE_TOKEN}`);
 
     const refused = await rpc(token, 'tools/call', {
@@ -337,23 +394,27 @@ async function main() {
     );
 
     console.log('\nRefresh');
-    const refreshed = await (
-      await fetch(`${CONNECTOR_ORIGIN}/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tokenResponse.refresh_token }),
-      })
-    ).json();
+    const refresh = (refreshToken, clientId) => fetch(`${CONNECTOR_ORIGIN}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId }),
+    }).then((r) => r.json());
+
+    const otherClient = await refresh(tokenResponse.refresh_token, 'some-other-client');
+    check('a refresh token is refused to a client it was not issued to', otherClient.error === 'invalid_grant');
+
+    const refreshed = await refresh(tokenResponse.refresh_token, registration.client_id);
     check('a refresh token exchanges for a new pair', typeof refreshed.access_token === 'string');
 
-    const reused = await (
-      await fetch(`${CONNECTOR_ORIGIN}/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: tokenResponse.refresh_token }),
-      })
-    ).json();
+    const stillWorks = await rpc(refreshed.access_token, 'tools/list', {}, 6);
+    check('the refreshed access token works', stillWorks.status === 200);
+
+    const reused = await refresh(tokenResponse.refresh_token, registration.client_id);
     check('the old refresh token is rotated out', reused.error === 'invalid_grant');
+
+    // Replaying a spent refresh token means two parties hold the session: all of it goes.
+    const afterReplay = await rpc(refreshed.access_token, 'tools/list', {}, 7);
+    check('replaying a rotated refresh token revokes the whole sign-in', afterReplay.status === 401);
   } finally {
     connector.kill();
     portal.close();
